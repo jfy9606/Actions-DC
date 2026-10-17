@@ -1,0 +1,174 @@
+name: build artex docker image
+
+run-name: "build (${{ inputs.architectures }}) @ ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch / tag / commit)"
+        required: false
+        default: "main"
+      architectures:
+        description: "Comma-separated architectures (amd64,arm64)"
+        required: false
+        default: "amd64,arm64"
+      mark_prerelease:
+        description: "Mark the release as pre-release"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: build-artex-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET_REPO: jfy9606/ARTEx
+  IMAGE_DOCKERFILE: Dockerfile.compose
+  IMAGE_REF: artex
+  GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      archmatrix: ${{ steps.meta.outputs.archmatrix }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: meta
+        id: meta
+        env:
+          ARCHES: ${{ inputs.architectures }}
+        run: |
+          version="$(git describe --tags --always --dirty 2>/dev/null || git rev-parse --short HEAD)"
+          short="$(git rev-parse --short HEAD)"
+          ts="$(date -u +%Y%m%d-%H%M%S)"
+          tag="image-${ts}-${short}"
+
+          json="["
+          first=1
+          IFS=',' read -ra arr <<< "$ARCHES"
+          for a in "${arr[@]}"; do
+            a="${a// /}"
+            [ -z "$a" ] && continue
+            [ "$first" -eq 0 ] && json="$json,"
+            json="$json{\"arch\":\"$a\",\"platform\":\"linux/$a\"}"
+            first=0
+          done
+          json="$json]"
+          if [ "$json" = "[]" ]; then echo "empty arch list" >&2; exit 1; fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archmatrix=$json" >> "$GITHUB_OUTPUT"
+
+      - name: notes
+        run: |
+          cat > /tmp/notes.md <<'MD'
+          ## ARTEX Docker image (offline)
+
+          ```bash
+          gunzip -c artex-image-linux-amd64.tar.gz | docker load
+          docker run --rm -p 8787:8787 -p 127.0.0.1:8788:8788 artex -addr :8787 -proxy :8788
+          ```
+          MD
+
+      - name: preflight
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty (secret missing or name mismatch)" >&2
+            exit 1
+          fi
+
+      - name: create draft release
+        run: |
+          extra=()
+          [ "${{ inputs.mark_prerelease }}" = "true" ] && extra+=(--prerelease)
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "$TARGET_REPO" \
+            --draft \
+            "${extra[@]}" \
+            --title "Docker image ${{ steps.meta.outputs.version }}" \
+            --notes-file /tmp/notes.md
+
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.archmatrix) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+
+      - name: qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build ${{ matrix.platform }}
+        run: |
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            -f "$IMAGE_DOCKERFILE" \
+            --build-arg ARTEX_BUILD_VERSION="${{ needs.prepare.outputs.version }}" \
+            -t "$IMAGE_REF:latest" \
+            -t "$IMAGE_REF:${{ needs.prepare.outputs.tag }}" \
+            --provenance=false --sbom=false \
+            --progress=plain \
+            --output type=docker,dest=/tmp/artex.tar \
+            .
+
+      - name: compress
+        run: |
+          if command -v pigz >/dev/null 2>&1; then
+            pigz -p "$(nproc)" /tmp/artex.tar
+          else
+            gzip /tmp/artex.tar
+          fi
+          mv /tmp/artex.tar.gz "/tmp/artex-image-linux-${{ matrix.arch }}.tar.gz"
+
+      - name: upload asset
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            "/tmp/artex-image-linux-${{ matrix.arch }}.tar.gz" \
+            --clobber --repo "$TARGET_REPO"
+
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [prepare, build]
+    steps:
+      - name: publish
+        run: |
+          gh release edit "${{ needs.prepare.outputs.tag }}" \
+            --draft=false --repo "$TARGET_REPO"
+
+      - name: summary
+        run: |
+          echo "Release: https://github.com/${TARGET_REPO}/releases/tag/${{ needs.prepare.outputs.tag }}" \
+            >> "$GITHUB_STEP_SUMMARY"
