@@ -66,8 +66,13 @@ jobs:
           for a in "${arr[@]}"; do
             a="${a// /}"
             [ -z "$a" ] && continue
+            case "$a" in
+              amd64) runner="ubuntu-24.04" ;;
+              arm64) runner="ubuntu-24.04-arm" ;;
+              *)     runner="ubuntu-latest" ;;
+            esac
             [ "$first" -eq 0 ] && json="$json,"
-            json="$json{\"arch\":\"$a\",\"platform\":\"linux/$a\"}"
+            json="$json{\"arch\":\"$a\",\"platform\":\"linux/$a\",\"runner\":\"$runner\"}"
             first=0
           done
           json="$json]"
@@ -108,7 +113,7 @@ jobs:
 
   build:
     name: build (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     needs: prepare
     strategy:
@@ -122,9 +127,6 @@ jobs:
           repository: ${{ env.TARGET_REPO }}
           token: ${{ secrets.REPO_TOKEN }}
           ref: ${{ inputs.ref }}
-
-      - name: qemu
-        uses: docker/setup-qemu-action@v3
 
       - name: buildx
         uses: docker/setup-buildx-action@v3
