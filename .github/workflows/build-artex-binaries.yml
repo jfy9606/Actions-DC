@@ -1,0 +1,117 @@
+name: build artex binaries
+
+run-name: "binaries (${{ inputs.targets }}) @ ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch / tag / commit)"
+        required: false
+        default: "main"
+      targets:
+        description: "Comma-separated OS/ARCH targets (Go cross-compile)"
+        required: false
+        default: "darwin/amd64,darwin/arm64,windows/amd64"
+      mark_prerelease:
+        description: "Mark the release as pre-release"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: build-artex-binaries
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET_REPO: jfy9606/ARTEx
+  GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zip
+
+      - name: meta
+        id: meta
+        run: |
+          version="$(git describe --tags --always --dirty 2>/dev/null || git rev-parse --short HEAD)"
+          short="$(git rev-parse --short HEAD)"
+          ts="$(date -u +%Y%m%d-%H%M%S)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=bin-${ts}-${short}" >> "$GITHUB_OUTPUT"
+
+      - name: frontend
+        run: |
+          cd web
+          npm ci --no-audit --no-fund
+          npm run build:static
+          cd ..
+          mkdir -p server/webui/dist
+          cp -a web/out/. server/webui/dist/
+
+      - name: cross-compile
+        env:
+          ARTEX_TARGETS: ${{ inputs.targets }}
+          ARTEX_BUILD_VERSION: ${{ steps.meta.outputs.version }}
+          ARTEX_COMPRESS: "0"
+          ARTEX_PACKAGE: "1"
+          ARTEX_PACKAGE_DIR: dist
+          ARTEX_SKIP_FRONTEND: "1"
+        run: |
+          ./build.sh --release
+          ls -lh dist/*.zip
+
+      - name: preflight
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty (secret missing or name mismatch)" >&2
+            exit 1
+          fi
+
+      - name: notes
+        run: |
+          cat > /tmp/notes.md <<'MD'
+          ## ARTEX binaries
+
+          - Windows (amd64): unzip, run start.bat
+          - macOS (amd64 / arm64): unzip, ./start.sh (or ./artex)
+          MD
+
+      - name: release
+        run: |
+          extra=()
+          [ "${{ inputs.mark_prerelease }}" = "true" ] && extra+=(--prerelease)
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "$TARGET_REPO" "${extra[@]}" \
+            --title "Binaries ${{ steps.meta.outputs.version }}" \
+            --notes-file /tmp/notes.md \
+            dist/*.zip dist/SHA256SUMS
